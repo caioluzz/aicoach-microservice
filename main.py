@@ -1,5 +1,5 @@
 import io
-import math
+import logging
 import zipfile
 from datetime import datetime
 from typing import List, Optional
@@ -11,6 +11,7 @@ from garminconnect import Garmin
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="AI RunCoach Garmin Bot")
+logger = logging.getLogger(__name__)
 
 class LapModel(BaseModel):
     lap_number: int
@@ -53,23 +54,31 @@ class GarminBotResponseDTO(BaseModel):
     max_speed_kmh: Optional[float] = None
     min_altitude_m: Optional[float] = None
     max_altitude_m: Optional[float] = None
+    ended_at: Optional[str] = None
+    best_pace_s_per_km: Optional[int] = None
+    max_hr: Optional[int] = None
+    avg_cadence: Optional[int] = None
+    max_cadence: Optional[int] = None
+    elevation_gain_m: Optional[int] = None
+    elevation_loss_m: Optional[int] = None
+    raw_file_path: Optional[str] = None
     lap_count: Optional[int] = None
     record_count: Optional[int] = None
-    laps: List[LapModel] = []
+    laps: List[LapModel] = Field(default_factory=list)
     activity_records: List[ActivityRecordModel] = Field(default_factory=list)
 
 
 class GarminBotRequest(BaseModel):
     email: str
     password: str
-    limit: int
+    limit: int = Field(ge=1, le=100)
 
 def meters_to_km(value):
-    return value / 1000 if value else None
+    return value / 1000 if value is not None else None
 
 
 def speed_to_kmh(value):
-    return value * 3.6 if value else None
+    return value * 3.6 if value is not None else None
 
 
 def speed_to_pace_s_per_km(speed_mps):
@@ -143,6 +152,21 @@ def process_fit_data(fit_bytes: bytes):
 
     return laps_data, records_data
 
+
+def extract_fit_bytes(raw_data: bytes) -> Optional[bytes]:
+    if raw_data.startswith(b"PK"):
+        with zipfile.ZipFile(io.BytesIO(raw_data)) as zf:
+            fit_names = [name for name in zf.namelist() if name.lower().endswith(".fit")]
+            return zf.read(fit_names[0]) if fit_names else None
+    if len(raw_data) >= 12 and raw_data[8:12] == b".FIT":
+        return raw_data
+    return None
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 @app.post("/api/garmin/activities", response_model=List[GarminBotResponseDTO])
 def fetch_activities(req: GarminBotRequest):
     try:
@@ -162,22 +186,15 @@ def fetch_activities(req: GarminBotRequest):
             try:
                 raw_data = client.download_activity(act_id, dl_fmt=Garmin.ActivityDownloadFormat.ORIGINAL)
 
-                # Descompactar em memória se for ZIP
-                if raw_data.startswith(b"PK"):
-                    with zipfile.ZipFile(io.BytesIO(raw_data)) as zf:
-                        fit_names = [name for name in zf.namelist() if name.lower().endswith('.fit')]
-                        if fit_names:
-                            fit_bytes = zf.read(fit_names[0])
-                            laps, records = process_fit_data(fit_bytes)
-                        else:
-                            laps, records = [], []
-                elif raw_data.startswith(b".FIT"):  # Caso já venha como FIT
-                    laps, records = process_fit_data(raw_data)
-                else:
-                    laps, records = [], []
+                fit_bytes = extract_fit_bytes(raw_data)
+                laps, records = process_fit_data(fit_bytes) if fit_bytes else ([], [])
 
             except Exception as e:
-                print(f"Erro ao processar arquivo FIT da atividade {act_id}: {e}")
+                logger.warning(
+                    "Falha ao processar FIT da atividade %s (%s)",
+                    act_id,
+                    type(e).__name__,
+                )
                 laps, records = [], []
 
             hr = act.get("averageHR")
@@ -191,7 +208,16 @@ def fetch_activities(req: GarminBotRequest):
                 average_heart_rate=int(hr) if hr else None,
                 average_speed=act.get("averageSpeed"),
                 sport=act.get("activityType", {}).get("typeKey"),
+                sub_sport=act.get("activityType", {}).get("parentTypeKey"),
                 is_vdot_test=is_vdot,
+                max_speed_kmh=speed_to_kmh(act.get("maxSpeed")),
+                min_altitude_m=act.get("minElevation"),
+                max_altitude_m=act.get("maxElevation"),
+                max_hr=act.get("maxHR"),
+                avg_cadence=act.get("averageRunningCadenceInStepsPerMinute"),
+                max_cadence=act.get("maxRunningCadenceInStepsPerMinute"),
+                elevation_gain_m=act.get("elevationGain"),
+                elevation_loss_m=act.get("elevationLoss"),
                 lap_count=len(laps),
                 record_count=len(records),
                 laps=laps,
@@ -202,5 +228,5 @@ def fetch_activities(req: GarminBotRequest):
         return results
 
     except Exception as e:
-        print(f"Erro ao buscar dados na Garmin: {e}")
+        logger.warning("Falha na extração Garmin (%s)", type(e).__name__)
         raise HTTPException(status_code=400, detail="Falha na extração da Garmin")

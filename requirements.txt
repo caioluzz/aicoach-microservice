@@ -1,5 +1,5 @@
-fastapi
-uvicorn
-garminconnect
-pydantic
-fitparse
+fastapi==0.141.1
+uvicorn==0.53.0
+garminconnect==0.3.16
+pydantic==2.13.5
+fitparse==1.2.0
