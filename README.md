@@ -23,15 +23,19 @@ Confirme em `GET http://127.0.0.1:8000/health`. A documentação OpenAPI fica em
 | --- | --- | --- |
 | `GET` | `/health` | Verifica se o processo está ativo sem acessar a Garmin |
 | `POST` | `/api/garmin/activities` | Recebe `email`, `password` e `limit` (1–100) |
+| `POST` | `/api/garmin/activities/discover` | Lista somente metadados, com `since` opcional |
+| `POST` | `/api/garmin/activities/{activity_id}/download` | Baixa e processa um único FIT |
 | `POST` | `/api/garmin/workouts/preview` | Compila `workout.v1` sem acessar a Garmin |
 | `POST` | `/api/garmin/workouts/deliver` | Cria/reutiliza o workout e agenda a data |
 | `PUT` | `/api/garmin/workouts/{workout_id}` | Atualiza o template e refaz o agendamento |
 | `POST` | `/api/garmin/workouts/confirm` | Confirma o item no mês do calendário |
 | `POST` | `/api/garmin/workouts/{workout_id}/cancel` | Remove calendário e template |
 
-O retorno contém resumo, indicador nominal de teste VDOT, laps e registros de
-telemetria. Arquivos FIT ZIP e FIT nativos são aceitos. Credenciais não são
-persistidas por este serviço e mensagens de erro não incluem o texto da exceção.
+O endpoint de descoberta nunca baixa FIT. O endpoint individual retorna resumo,
+indicador nominal de teste VDOT, laps e registros de telemetria. Arquivos FIT ZIP e
+FIT nativos são aceitos. Credenciais não são persistidas por este serviço e mensagens
+de erro não incluem o texto da exceção. O endpoint agregado anterior permanece por
+compatibilidade, mas o pipeline eficiente do backend usa somente as duas novas rotas.
 
 O compilador suporta aquecimento, corrida, recuperação, desaquecimento, duração
 por tempo/distância, alvo de pace e grupos repetidos. O marcador `ARC` derivado da
@@ -59,9 +63,9 @@ atualização, confirmação e cancelamento.
 - a integração usa uma biblioteca não oficial e pode sofrer mudanças do Garmin;
 - a autenticação compartilhada é opcional para preservar o modo local; sem
   `GARMIN_ADAPTER_API_KEY`, as rotas internas permanecem abertas;
-- cada sincronização faz novo login e download dos arquivos, sem cache/retry/backoff;
-- falhas de um FIT são degradadas para listas vazias, sem sinalização por atividade;
+- cada chamada ainda faz novo login; retries e backoff são responsabilidade do backend;
+- o endpoint agregado legado ainda degrada falhas de FIT para listas vazias;
 - `ended_at`, melhor pace e alguns campos dependem de dados que ainda não são
   derivados do resumo Garmin; permanecem nulos no contrato;
 - não existe cálculo numérico de VDOT: a marcação é baseada apenas no nome;
-- sincronização eficiente, comparação e análise pós-treino pertencem às etapas seguintes.
+- comparação e análise pós-treino pertencem às etapas seguintes.

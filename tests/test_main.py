@@ -1,5 +1,6 @@
 import io
 import zipfile
+from datetime import datetime
 
 from fastapi.testclient import TestClient
 
@@ -101,3 +102,104 @@ def test_fetch_activities_maps_summary_and_fit_details(monkeypatch):
     assert activity["lap_count"] == 1
     assert activity["record_count"] == 1
     assert activity["max_speed_kmh"] == 18.0
+
+
+def test_discovery_returns_metadata_without_downloading_fit(monkeypatch):
+    calls = {"downloads": 0}
+
+    class FakeGarmin:
+        def __init__(self, email, password):
+            assert (email, password) == ("runner@example.test", "secret")
+
+        def login(self):
+            return None
+
+        def get_activities(self, start, limit):
+            assert (start, limit) == (0, 10)
+            return [
+                {
+                    "activityId": 100,
+                    "activityName": "Corrida nova",
+                    "startTimeLocal": "2026-09-18 07:00:00",
+                    "activityType": {"typeKey": "running"},
+                },
+                {
+                    "activityId": 99,
+                    "activityName": "Corrida antiga",
+                    "startTimeLocal": "2026-09-10 07:00:00",
+                    "activityType": {"typeKey": "running"},
+                },
+            ]
+
+        def download_activity(self, *_args, **_kwargs):
+            calls["downloads"] += 1
+
+    monkeypatch.setattr(main, "Garmin", FakeGarmin)
+    response = client.post(
+        "/api/garmin/activities/discover",
+        json={
+            "email": "runner@example.test",
+            "password": "secret",
+            "limit": 10,
+            "since": datetime(2026, 9, 17).isoformat(),
+        },
+    )
+
+    assert response.status_code == 200
+    assert [item["activity_id"] for item in response.json()] == [100]
+    assert calls["downloads"] == 0
+
+
+def test_download_fetches_and_processes_only_requested_activity(monkeypatch):
+    class FakeGarmin:
+        ActivityDownloadFormat = main.Garmin.ActivityDownloadFormat
+
+        def __init__(self, email, password):
+            assert (email, password) == ("runner@example.test", "secret")
+
+        def login(self):
+            return None
+
+        def get_activity(self, activity_id):
+            assert activity_id == 100
+            return {
+                "activityId": 100,
+                "activityName": "Corrida nova",
+                "startTimeLocal": "2026-09-18 07:00:00",
+                "activityType": {"typeKey": "running"},
+            }
+
+        def download_activity(self, activity_id, dl_fmt):
+            assert activity_id == 100
+            return b"\x0e\x00\x00\x00\x00\x00\x00\x00.FITpayload"
+
+    monkeypatch.setattr(main, "Garmin", FakeGarmin)
+    monkeypatch.setattr(main, "process_fit_data", lambda _: ([], []))
+    response = client.post(
+        "/api/garmin/activities/100/download",
+        json={"email": "runner@example.test", "password": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["activity_id"] == 100
+    assert response.json()["record_count"] == 0
+
+
+def test_download_reports_missing_activity(monkeypatch):
+    class FakeGarmin:
+        def __init__(self, _email, _password):
+            pass
+
+        def login(self):
+            return None
+
+        def get_activity(self, _activity_id):
+            return None
+
+    monkeypatch.setattr(main, "Garmin", FakeGarmin)
+    response = client.post(
+        "/api/garmin/activities/404/download",
+        json={"email": "runner@example.test", "password": "secret"},
+    )
+
+    assert response.status_code == 404
