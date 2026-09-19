@@ -15,6 +15,19 @@ def test_health():
     assert response.json() == {"status": "ok"}
 
 
+def test_optional_adapter_key_protects_garmin_routes(monkeypatch):
+    monkeypatch.setattr(main, "adapter_api_key", "shared-secret")
+    denied = client.post("/api/garmin/workouts/preview", json={})
+    allowed = client.post(
+        "/api/garmin/workouts/preview",
+        headers={"X-Adapter-Key": "shared-secret"},
+        json={},
+    )
+    assert denied.status_code == 401
+    assert allowed.status_code == 422
+    assert client.get("/health").status_code == 200
+
+
 def test_request_rejects_limit_outside_supported_range():
     response = client.post(
         "/api/garmin/activities",
