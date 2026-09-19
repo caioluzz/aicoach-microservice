@@ -1,17 +1,43 @@
 import io
 import logging
+import os
+import secrets
 import zipfile
 from datetime import datetime
 from typing import List, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi import Request
 from fitparse import FitFile
 from garminconnect import Garmin
 from pydantic import BaseModel, Field
+from starlette.responses import JSONResponse
+
+from workout_delivery import (
+    CancelWorkoutRequest,
+    ConfirmWorkoutRequest,
+    DeliverWorkoutRequest,
+    GarminWorkoutService,
+    UpdateWorkoutRequest,
+    WorkoutRequest,
+    compile_workout,
+    workout_hash,
+)
 
 app = FastAPI(title="AI RunCoach Garmin Bot")
 logger = logging.getLogger(__name__)
+workout_service = GarminWorkoutService()
+adapter_api_key = os.getenv("GARMIN_ADAPTER_API_KEY", "")
+
+
+@app.middleware("http")
+async def protect_adapter(request: Request, call_next):
+    if adapter_api_key and request.url.path.startswith("/api/garmin/"):
+        supplied = request.headers.get("X-Adapter-Key", "")
+        if not secrets.compare_digest(supplied, adapter_api_key):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized adapter request"})
+    return await call_next(request)
 
 class LapModel(BaseModel):
     lap_number: int
@@ -166,6 +192,53 @@ def extract_fit_bytes(raw_data: bytes) -> Optional[bytes]:
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/api/garmin/workouts/preview")
+def preview_workout(workout: WorkoutRequest):
+    digest = workout_hash(workout)
+    return {
+        "hash": digest,
+        "idempotencyKey": digest,
+        "scheduledDate": workout.scheduled_date,
+        "payload": compile_workout(workout, digest),
+    }
+
+
+@app.post("/api/garmin/workouts/deliver")
+def deliver_workout(request: DeliverWorkoutRequest):
+    try:
+        return workout_service.deliver(request)
+    except Exception as exc:
+        logger.warning("Falha ao entregar workout Garmin (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Falha na entrega do workout Garmin") from None
+
+
+@app.put("/api/garmin/workouts/{workout_id}")
+def update_workout(workout_id: int, request: UpdateWorkoutRequest):
+    try:
+        return workout_service.update(workout_id, request)
+    except Exception as exc:
+        logger.warning("Falha ao atualizar workout Garmin (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Falha na atualizacao do workout Garmin") from None
+
+
+@app.post("/api/garmin/workouts/confirm")
+def confirm_workout(request: ConfirmWorkoutRequest):
+    try:
+        return workout_service.confirm(request)
+    except Exception as exc:
+        logger.warning("Falha ao confirmar workout Garmin (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Falha na confirmacao do workout Garmin") from None
+
+
+@app.post("/api/garmin/workouts/{workout_id}/cancel")
+def cancel_workout(workout_id: int, request: CancelWorkoutRequest):
+    try:
+        return workout_service.cancel(workout_id, request)
+    except Exception as exc:
+        logger.warning("Falha ao cancelar workout Garmin (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Falha no cancelamento do workout Garmin") from None
 
 @app.post("/api/garmin/activities", response_model=List[GarminBotResponseDTO])
 def fetch_activities(req: GarminBotRequest):
