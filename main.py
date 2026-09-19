@@ -99,6 +99,36 @@ class GarminBotRequest(BaseModel):
     password: str
     limit: int = Field(ge=1, le=100)
 
+
+class ActivityDiscoveryRequest(GarminBotRequest):
+    since: Optional[datetime] = None
+
+
+class ActivityDownloadRequest(BaseModel):
+    email: str
+    password: str
+
+
+class ActivityMetadata(BaseModel):
+    activity_id: int
+    activity_name: str
+    distance_meters: Optional[float] = None
+    duration_seconds: Optional[float] = None
+    started_at: Optional[str] = None
+    average_heart_rate: Optional[int] = None
+    average_speed: Optional[float] = None
+    sport: Optional[str] = None
+    sub_sport: Optional[str] = None
+    is_vdot_test: bool = False
+    max_speed_kmh: Optional[float] = None
+    min_altitude_m: Optional[float] = None
+    max_altitude_m: Optional[float] = None
+    max_hr: Optional[int] = None
+    avg_cadence: Optional[int] = None
+    max_cadence: Optional[int] = None
+    elevation_gain_m: Optional[int] = None
+    elevation_loss_m: Optional[int] = None
+
 def meters_to_km(value):
     return value / 1000 if value is not None else None
 
@@ -187,6 +217,47 @@ def extract_fit_bytes(raw_data: bytes) -> Optional[bytes]:
     if len(raw_data) >= 12 and raw_data[8:12] == b".FIT":
         return raw_data
     return None
+
+
+def connect_garmin(email: str, password: str):
+    client = Garmin(email, password)
+    client.login()
+    return client
+
+
+def map_activity_metadata(activity: dict) -> ActivityMetadata:
+    name = activity.get("activityName", "Sem Nome")
+    heart_rate = activity.get("averageHR")
+    return ActivityMetadata(
+        activity_id=activity.get("activityId"),
+        activity_name=name,
+        distance_meters=activity.get("distance"),
+        duration_seconds=activity.get("duration"),
+        started_at=activity.get("startTimeLocal"),
+        average_heart_rate=int(heart_rate) if heart_rate else None,
+        average_speed=activity.get("averageSpeed"),
+        sport=activity.get("activityType", {}).get("typeKey"),
+        sub_sport=activity.get("activityType", {}).get("parentTypeKey"),
+        is_vdot_test="vdot" in name.lower() or "teste 3km" in name.lower(),
+        max_speed_kmh=speed_to_kmh(activity.get("maxSpeed")),
+        min_altitude_m=activity.get("minElevation"),
+        max_altitude_m=activity.get("maxElevation"),
+        max_hr=activity.get("maxHR"),
+        avg_cadence=activity.get("averageRunningCadenceInStepsPerMinute"),
+        max_cadence=activity.get("maxRunningCadenceInStepsPerMinute"),
+        elevation_gain_m=activity.get("elevationGain"),
+        elevation_loss_m=activity.get("elevationLoss"),
+    )
+
+
+def metadata_to_response(metadata: ActivityMetadata, laps, records) -> GarminBotResponseDTO:
+    return GarminBotResponseDTO(
+        **metadata.model_dump(),
+        lap_count=len(laps),
+        record_count=len(records),
+        laps=laps,
+        activity_records=records,
+    )
 
 
 @app.get("/health")
@@ -303,3 +374,48 @@ def fetch_activities(req: GarminBotRequest):
     except Exception as e:
         logger.warning("Falha na extração Garmin (%s)", type(e).__name__)
         raise HTTPException(status_code=400, detail="Falha na extração da Garmin")
+
+
+@app.post("/api/garmin/activities/discover", response_model=List[ActivityMetadata])
+def discover_activities(req: ActivityDiscoveryRequest):
+    try:
+        client = connect_garmin(req.email, req.password)
+        activities = [map_activity_metadata(item) for item in client.get_activities(0, req.limit)]
+        if req.since is None:
+            return activities
+        since = req.since.replace(tzinfo=None)
+        return [
+            item for item in activities
+            if item.started_at is not None
+            and datetime.fromisoformat(item.started_at).replace(tzinfo=None) >= since
+        ]
+    except Exception as exc:
+        logger.warning("Falha na descoberta Garmin (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Falha na descoberta de atividades Garmin") from None
+
+
+@app.post("/api/garmin/activities/{activity_id}/download", response_model=GarminBotResponseDTO)
+def download_activity(activity_id: int, req: ActivityDownloadRequest):
+    try:
+        client = connect_garmin(req.email, req.password)
+        raw_activity = client.get_activity(activity_id)
+        if raw_activity is None:
+            raise HTTPException(status_code=404, detail="Atividade Garmin não encontrada")
+        raw_data = client.download_activity(
+            activity_id,
+            dl_fmt=Garmin.ActivityDownloadFormat.ORIGINAL,
+        )
+        fit_bytes = extract_fit_bytes(raw_data)
+        if fit_bytes is None:
+            raise HTTPException(status_code=422, detail="Arquivo FIT inválido")
+        laps, records = process_fit_data(fit_bytes)
+        return metadata_to_response(map_activity_metadata(raw_activity), laps, records)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Falha ao baixar atividade Garmin %s (%s)",
+            activity_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(status_code=502, detail="Falha no download da atividade Garmin") from None
