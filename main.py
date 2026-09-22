@@ -1,17 +1,27 @@
 import io
+import hashlib
 import logging
 import os
 import secrets
+import tempfile
+import threading
 import zipfile
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi import Request
 from fitparse import FitFile
-from garminconnect import Garmin
-from pydantic import BaseModel, Field
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectNotFoundError,
+    GarminConnectTooManyRequestsError,
+)
+from pydantic import BaseModel, Field, ValidationError
 from starlette.responses import JSONResponse
 
 from workout_delivery import (
@@ -25,10 +35,11 @@ from workout_delivery import (
     workout_hash,
 )
 
-app = FastAPI(title="AI RunCoach Garmin Bot")
+app = FastAPI(title="AI RunCoach")
 logger = logging.getLogger(__name__)
 workout_service = GarminWorkoutService()
 adapter_api_key = os.getenv("GARMIN_ADAPTER_API_KEY", "")
+garmin_login_lock = threading.RLock()
 
 
 @app.middleware("http")
@@ -129,6 +140,13 @@ class ActivityMetadata(BaseModel):
     elevation_gain_m: Optional[int] = None
     elevation_loss_m: Optional[int] = None
 
+
+class ActivityDiscoveryMetadata(BaseModel):
+    activity_id: int
+    activity_name: str
+    started_at: Optional[str] = None
+    is_vdot_test: bool = False
+
 def meters_to_km(value):
     return value / 1000 if value is not None else None
 
@@ -149,8 +167,35 @@ def format_datetime(dt):
     return None
 
 
+def normalize_datetime(value):
+    if isinstance(value, datetime):
+        return format_datetime(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            normalized = value.strip().replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return value.strip()
+    return None
+
+
 def message_to_dict(message):
     return {field.name: field.value for field in message}
+
+
+def fit_sport_metadata(fit_bytes: bytes):
+    fit = FitFile(io.BytesIO(fit_bytes))
+    for message_name in ("session", "sport"):
+        for message in fit.get_messages(message_name):
+            row = message_to_dict(message)
+            sport = row.get("sport")
+            sub_sport = row.get("sub_sport")
+            if sport or sub_sport:
+                return (
+                    str(sport) if sport is not None else None,
+                    str(sub_sport) if sub_sport is not None else None,
+                )
+    return None, None
 
 
 def process_fit_data(fit_bytes: bytes):
@@ -219,25 +264,100 @@ def extract_fit_bytes(raw_data: bytes) -> Optional[bytes]:
     return None
 
 
+def garmin_tokenstore(email: str) -> str:
+    configured = os.getenv("GARMIN_TOKEN_DIR")
+    root = Path(configured) if configured else Path(
+        os.getenv("LOCALAPPDATA") or tempfile.gettempdir()
+    ) / "AIRunCoach" / "garmin-tokens"
+    account_key = hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()
+    return str(root / account_key)
+
+
 def connect_garmin(email: str, password: str):
     client = Garmin(email, password)
-    client.login()
+    # A biblioteca persiste apenas tokens OAuth, com permissão restrita ao
+    # usuário do processo. Isso evita um login SSO novo a cada request e reduz
+    # bloqueios do Garmin por excesso de autenticações.
+    with garmin_login_lock:
+        client.login(garmin_tokenstore(email))
     return client
 
 
-def map_activity_metadata(activity: dict) -> ActivityMetadata:
-    name = activity.get("activityName", "Sem Nome")
-    heart_rate = activity.get("averageHR")
-    return ActivityMetadata(
-        activity_id=activity.get("activityId"),
+def raise_garmin_http_error(exc: Exception, operation: str):
+    logger.warning("Falha Garmin operation=%s error_type=%s", operation, type(exc).__name__)
+    if isinstance(exc, GarminConnectAuthenticationError):
+        raise HTTPException(
+            status_code=401,
+            detail="O Garmin rejeitou as credenciais ou exige uma validação adicional na conta.",
+        ) from None
+    if isinstance(exc, GarminConnectTooManyRequestsError):
+        raise HTTPException(
+            status_code=429,
+            detail="O Garmin limitou temporariamente as tentativas. Aguarde alguns minutos e tente novamente.",
+        ) from None
+    if isinstance(exc, GarminConnectNotFoundError):
+        raise HTTPException(status_code=404, detail="Atividade Garmin não encontrada para esta conta.") from None
+    if isinstance(exc, GarminConnectConnectionError):
+        raise HTTPException(
+            status_code=503,
+            detail="O Garmin Connect está indisponível ou recusou a conexão temporariamente.",
+        ) from None
+    raise HTTPException(status_code=502, detail=f"Falha inesperada ao {operation} no Garmin.") from None
+
+
+def activity_type_metadata(activity: dict, summary: dict):
+    candidates = (
+        activity.get("activityType"),
+        activity.get("activityTypeDTO"),
+        activity.get("sportType"),
+        activity.get("sportTypeDTO"),
+        summary.get("activityType"),
+        summary.get("activityTypeDTO"),
+        summary.get("sportType"),
+        summary.get("sportTypeDTO"),
+    )
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        sport = candidate.get("typeKey") or candidate.get("sportTypeKey")
+        sub_sport = candidate.get("parentTypeKey") or candidate.get("subSportTypeKey")
+        if sport or sub_sport:
+            return sport, sub_sport
+    return None, None
+
+
+def map_discovery_metadata(activity: dict) -> ActivityDiscoveryMetadata:
+    summary = activity.get("summaryDTO") if isinstance(activity.get("summaryDTO"), dict) else {}
+    name = activity.get("activityName") or summary.get("activityName") or "Sem Nome"
+    return ActivityDiscoveryMetadata(
+        activity_id=activity.get("activityId") or summary.get("activityId"),
         activity_name=name,
-        distance_meters=activity.get("distance"),
-        duration_seconds=activity.get("duration"),
-        started_at=activity.get("startTimeLocal"),
+        started_at=normalize_datetime(
+            activity.get("startTimeLocal") or summary.get("startTimeLocal")
+            or activity.get("startTimeGMT") or summary.get("startTimeGMT")
+        ),
+        is_vdot_test="vdot" in name.lower() or "teste 3km" in name.lower(),
+    )
+
+
+def map_activity_metadata(activity: dict) -> ActivityMetadata:
+    summary = activity.get("summaryDTO") if isinstance(activity.get("summaryDTO"), dict) else {}
+    sport, sub_sport = activity_type_metadata(activity, summary)
+    name = activity.get("activityName") or summary.get("activityName") or "Sem Nome"
+    heart_rate = activity.get("averageHR") or summary.get("averageHR")
+    return ActivityMetadata(
+        activity_id=activity.get("activityId") or summary.get("activityId"),
+        activity_name=name,
+        distance_meters=activity.get("distance") or summary.get("distance"),
+        duration_seconds=activity.get("duration") or summary.get("duration"),
+        started_at=normalize_datetime(
+            activity.get("startTimeLocal") or summary.get("startTimeLocal")
+            or activity.get("startTimeGMT") or summary.get("startTimeGMT")
+        ),
         average_heart_rate=int(heart_rate) if heart_rate else None,
-        average_speed=activity.get("averageSpeed"),
-        sport=activity.get("activityType", {}).get("typeKey"),
-        sub_sport=activity.get("activityType", {}).get("parentTypeKey"),
+        average_speed=activity.get("averageSpeed") or summary.get("averageSpeed"),
+        sport=sport,
+        sub_sport=sub_sport,
         is_vdot_test="vdot" in name.lower() or "teste 3km" in name.lower(),
         max_speed_kmh=speed_to_kmh(activity.get("maxSpeed")),
         min_altitude_m=activity.get("minElevation"),
@@ -251,8 +371,13 @@ def map_activity_metadata(activity: dict) -> ActivityMetadata:
 
 
 def metadata_to_response(metadata: ActivityMetadata, laps, records) -> GarminBotResponseDTO:
+    started_at = metadata.started_at
+    if started_at is None:
+        started_at = next((record.ts for record in records if record.ts), None)
+    if started_at is None:
+        started_at = next((lap.start_time for lap in laps if lap.start_time), None)
     return GarminBotResponseDTO(
-        **metadata.model_dump(),
+        **(metadata.model_dump() | {"started_at": started_at}),
         lap_count=len(laps),
         record_count=len(records),
         laps=laps,
@@ -314,8 +439,7 @@ def cancel_workout(workout_id: int, request: CancelWorkoutRequest):
 @app.post("/api/garmin/activities", response_model=List[GarminBotResponseDTO])
 def fetch_activities(req: GarminBotRequest):
     try:
-        client = Garmin(req.email, req.password)
-        client.login()
+        client = connect_garmin(req.email, req.password)
 
         raw_activities = client.get_activities(0, req.limit)
 
@@ -371,16 +495,43 @@ def fetch_activities(req: GarminBotRequest):
 
         return results
 
-    except Exception as e:
-        logger.warning("Falha na extração Garmin (%s)", type(e).__name__)
-        raise HTTPException(status_code=400, detail="Falha na extração da Garmin")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise_garmin_http_error(exc, "extrair atividades")
 
 
-@app.post("/api/garmin/activities/discover", response_model=List[ActivityMetadata])
+@app.post("/api/garmin/activities/discover", response_model=List[ActivityDiscoveryMetadata])
 def discover_activities(req: ActivityDiscoveryRequest):
     try:
         client = connect_garmin(req.email, req.password)
-        activities = [map_activity_metadata(item) for item in client.get_activities(0, req.limit)]
+        raw_activities = client.get_activities(0, req.limit)
+        if not isinstance(raw_activities, list):
+            raise HTTPException(
+                status_code=502,
+                detail="O Garmin devolveu um formato inesperado ao listar atividades.",
+            )
+        activities = []
+        for index, item in enumerate(raw_activities):
+            if not isinstance(item, dict):
+                logger.warning(
+                    "Atividade Garmin ignorada index=%s reason=invalid_item_type", index
+                )
+                continue
+            try:
+                activities.append(map_discovery_metadata(item))
+            except ValidationError as exc:
+                error_types = sorted({error["type"] for error in exc.errors()})
+                logger.warning(
+                    "Atividade Garmin ignorada index=%s reason=validation error_types=%s",
+                    index,
+                    ",".join(error_types),
+                )
+        if raw_activities and not activities:
+            raise HTTPException(
+                status_code=502,
+                detail="Nenhuma atividade da resposta Garmin possuía identificador utilizável.",
+            )
         if req.since is None:
             return activities
         since = req.since.replace(tzinfo=None)
@@ -390,8 +541,7 @@ def discover_activities(req: ActivityDiscoveryRequest):
             and datetime.fromisoformat(item.started_at).replace(tzinfo=None) >= since
         ]
     except Exception as exc:
-        logger.warning("Falha na descoberta Garmin (%s)", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Falha na descoberta de atividades Garmin") from None
+        raise_garmin_http_error(exc, "listar atividades")
 
 
 @app.post("/api/garmin/activities/{activity_id}/download", response_model=GarminBotResponseDTO)
@@ -409,13 +559,21 @@ def download_activity(activity_id: int, req: ActivityDownloadRequest):
         if fit_bytes is None:
             raise HTTPException(status_code=422, detail="Arquivo FIT inválido")
         laps, records = process_fit_data(fit_bytes)
-        return metadata_to_response(map_activity_metadata(raw_activity), laps, records)
+        metadata = map_activity_metadata(raw_activity)
+        if metadata.sport is None:
+            fit_sport, fit_sub_sport = fit_sport_metadata(fit_bytes)
+            metadata = metadata.model_copy(update={
+                "sport": fit_sport,
+                "sub_sport": metadata.sub_sport or fit_sub_sport,
+            })
+        response = metadata_to_response(metadata, laps, records)
+        if response.started_at is None:
+            raise HTTPException(
+                status_code=422,
+                detail="A atividade Garmin não informou data de início no resumo nem no FIT.",
+            )
+        return response
     except HTTPException:
         raise
     except Exception as exc:
-        logger.warning(
-            "Falha ao baixar atividade Garmin %s (%s)",
-            activity_id,
-            type(exc).__name__,
-        )
-        raise HTTPException(status_code=502, detail="Falha no download da atividade Garmin") from None
+        raise_garmin_http_error(exc, "baixar a atividade")

@@ -48,6 +48,37 @@ def test_unit_conversions_preserve_zero_values():
     assert main.speed_to_pace_s_per_km(0) is None
 
 
+def test_normalize_datetime_accepts_garmin_iso_fraction():
+    assert main.normalize_datetime("2026-09-21T17:48:18.0") == "2026-09-21 17:48:18"
+
+
+def test_metadata_accepts_activity_type_dto_used_by_activity_details():
+    metadata = main.map_activity_metadata({
+        "activityId": 100,
+        "activityName": "Teste 3km",
+        "activityTypeDTO": {
+            "typeKey": "running",
+            "parentTypeKey": "generic",
+        },
+    })
+
+    assert metadata.sport == "running"
+    assert metadata.sub_sport == "generic"
+
+
+def test_discovery_metadata_ignores_decimal_detail_fields():
+    metadata = main.map_discovery_metadata({
+        "activityId": 100,
+        "activityName": "Corrida",
+        "startTimeLocal": "2026-09-21T17:48:18.0",
+        "averageRunningCadenceInStepsPerMinute": 84.7,
+        "elevationGain": 12.35,
+    })
+
+    assert metadata.activity_id == 100
+    assert metadata.started_at == "2026-09-21 17:48:18"
+
+
 def test_extract_fit_bytes_reads_fit_from_zip():
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -63,7 +94,7 @@ def test_fetch_activities_maps_summary_and_fit_details(monkeypatch):
             assert email == "runner@example.test"
             assert password == "secret"
 
-        def login(self):
+        def login(self, *_args):
             return None
 
         def get_activities(self, start, limit):
@@ -111,7 +142,7 @@ def test_discovery_returns_metadata_without_downloading_fit(monkeypatch):
         def __init__(self, email, password):
             assert (email, password) == ("runner@example.test", "secret")
 
-        def login(self):
+        def login(self, *_args):
             return None
 
         def get_activities(self, start, limit):
@@ -150,6 +181,34 @@ def test_discovery_returns_metadata_without_downloading_fit(monkeypatch):
     assert calls["downloads"] == 0
 
 
+def test_discovery_skips_only_item_without_activity_id(monkeypatch):
+    class FakeGarmin:
+        def __init__(self, _email, _password):
+            pass
+
+        def login(self, *_args):
+            return None
+
+        def get_activities(self, _start, _limit):
+            return [
+                {"activityName": "Entrada incompleta"},
+                {
+                    "activityId": 101,
+                    "activityName": "Corrida válida",
+                    "startTimeLocal": "2026-09-21 07:00:00",
+                },
+            ]
+
+    monkeypatch.setattr(main, "Garmin", FakeGarmin)
+    response = client.post(
+        "/api/garmin/activities/discover",
+        json={"email": "runner@example.test", "password": "secret", "limit": 10},
+    )
+
+    assert response.status_code == 200
+    assert [item["activity_id"] for item in response.json()] == [101]
+
+
 def test_download_fetches_and_processes_only_requested_activity(monkeypatch):
     class FakeGarmin:
         ActivityDownloadFormat = main.Garmin.ActivityDownloadFormat
@@ -157,7 +216,7 @@ def test_download_fetches_and_processes_only_requested_activity(monkeypatch):
         def __init__(self, email, password):
             assert (email, password) == ("runner@example.test", "secret")
 
-        def login(self):
+        def login(self, *_args):
             return None
 
         def get_activity(self, activity_id):
@@ -190,7 +249,7 @@ def test_download_reports_missing_activity(monkeypatch):
         def __init__(self, _email, _password):
             pass
 
-        def login(self):
+        def login(self, *_args):
             return None
 
         def get_activity(self, _activity_id):
@@ -203,3 +262,111 @@ def test_download_reports_missing_activity(monkeypatch):
     )
 
     assert response.status_code == 404
+
+
+def test_discovery_classifies_authentication_failure(monkeypatch):
+    class FakeGarmin:
+        def __init__(self, _email, _password):
+            pass
+
+        def login(self, *_args):
+            raise main.GarminConnectAuthenticationError("secret upstream detail")
+
+    monkeypatch.setattr(main, "Garmin", FakeGarmin)
+    response = client.post(
+        "/api/garmin/activities/discover",
+        json={"email": "runner@example.test", "password": "wrong", "limit": 10},
+    )
+
+    assert response.status_code == 401
+    assert "credenciais" in response.json()["detail"]
+    assert "secret upstream detail" not in response.text
+
+
+def test_connect_uses_stable_account_specific_tokenstore(monkeypatch, tmp_path):
+    captured = []
+
+    class FakeGarmin:
+        def __init__(self, _email, _password):
+            pass
+
+        def login(self, tokenstore):
+            captured.append(tokenstore)
+
+    monkeypatch.setenv("GARMIN_TOKEN_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "Garmin", FakeGarmin)
+
+    main.connect_garmin("Runner@Example.Test", "secret")
+    main.connect_garmin("runner@example.test", "secret")
+
+    assert captured[0] == captured[1]
+    assert "runner@example.test" not in captured[0]
+
+
+def test_download_uses_first_fit_record_when_summary_has_no_start_time(monkeypatch):
+    class FakeGarmin:
+        ActivityDownloadFormat = main.Garmin.ActivityDownloadFormat
+
+        def __init__(self, _email, _password):
+            pass
+
+        def login(self, *_args):
+            return None
+
+        def get_activity(self, activity_id):
+            return {
+                "activityId": activity_id,
+                "activityName": "Teste 3km",
+                "activityType": {"typeKey": "running"},
+            }
+
+        def download_activity(self, _activity_id, dl_fmt):
+            assert dl_fmt == main.Garmin.ActivityDownloadFormat.ORIGINAL
+            return b"\x0e\x00\x00\x00\x00\x00\x00\x00.FITpayload"
+
+    record = main.ActivityRecordModel(ts="2026-09-21 07:30:00", elapsed_s=0)
+    monkeypatch.setattr(main, "Garmin", FakeGarmin)
+    monkeypatch.setattr(main, "process_fit_data", lambda _: ([], [record]))
+
+    response = client.post(
+        "/api/garmin/activities/24448621354/download",
+        json={"email": "runner@example.test", "password": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["started_at"] == "2026-09-21 07:30:00"
+
+
+def test_download_uses_fit_sport_when_activity_detail_omits_type(monkeypatch):
+    class FakeGarmin:
+        ActivityDownloadFormat = main.Garmin.ActivityDownloadFormat
+
+        def __init__(self, _email, _password):
+            pass
+
+        def login(self, *_args):
+            return None
+
+        def get_activity(self, activity_id):
+            return {
+                "activityId": activity_id,
+                "activityName": "Teste 3km",
+                "startTimeLocal": "2026-09-21 20:48:18",
+            }
+
+        def download_activity(self, _activity_id, dl_fmt):
+            assert dl_fmt == main.Garmin.ActivityDownloadFormat.ORIGINAL
+            return b"\x0e\x00\x00\x00\x00\x00\x00\x00.FITpayload"
+
+    monkeypatch.setattr(main, "Garmin", FakeGarmin)
+    monkeypatch.setattr(main, "process_fit_data", lambda _: ([], []))
+    monkeypatch.setattr(main, "fit_sport_metadata", lambda _: ("running", "generic"))
+
+    response = client.post(
+        "/api/garmin/activities/24448621354/download",
+        json={"email": "runner@example.test", "password": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["sport"] == "running"
+    assert response.json()["sub_sport"] == "generic"
