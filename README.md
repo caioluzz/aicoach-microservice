@@ -33,8 +33,10 @@ Confirme em `GET http://127.0.0.1:8000/health`. A documentação OpenAPI fica em
 
 O endpoint de descoberta nunca baixa FIT. O endpoint individual retorna resumo,
 indicador nominal de teste VDOT, laps e registros de telemetria. Arquivos FIT ZIP e
-FIT nativos são aceitos. Credenciais não são persistidas por este serviço e mensagens
-de erro não incluem o texto da exceção. O endpoint agregado anterior permanece por
+FIT nativos são aceitos. Senhas não são persistidas por este serviço; tokens OAuth
+são reutilizados no diretório local protegido da conta do processo para evitar um
+novo login SSO por chamada. Defina `GARMIN_TOKEN_DIR` para escolher outro diretório.
+Mensagens de erro não incluem o texto da exceção. O endpoint agregado anterior permanece por
 compatibilidade, mas o pipeline eficiente do backend usa somente as duas novas rotas.
 
 O compilador suporta aquecimento, corrida, recuperação, desaquecimento, duração
@@ -63,7 +65,8 @@ atualização, confirmação e cancelamento.
 - a integração usa uma biblioteca não oficial e pode sofrer mudanças do Garmin;
 - a autenticação compartilhada é opcional para preservar o modo local; sem
   `GARMIN_ADAPTER_API_KEY`, as rotas internas permanecem abertas;
-- cada chamada ainda faz novo login; retries e backoff são responsabilidade do backend;
+- a sessão usa tokens OAuth em disco; revogar a conta ou apagar o diretório exige
+  uma nova autenticação com as credenciais configuradas;
 - o endpoint agregado legado ainda degrada falhas de FIT para listas vazias;
 - `ended_at`, melhor pace e alguns campos dependem de dados que ainda não são
   derivados do resumo Garmin; permanecem nulos no contrato;
